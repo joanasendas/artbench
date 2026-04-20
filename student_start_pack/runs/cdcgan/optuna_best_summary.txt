@@ -1,4 +1,0 @@
-==== RESULTADOS FINAIS OPTUNA - cDCGAN ====
-Melhor Trial: 22
-Melhor Loss do Gerador: 0.7948
-Melhores Hiperparâmetros: {'lr': 0.00037796394821210165, 'latent_dim': 100, 'beta1': 0.0, 'feature_maps': 64}

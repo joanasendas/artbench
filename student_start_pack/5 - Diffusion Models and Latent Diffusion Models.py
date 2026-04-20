@@ -50,6 +50,15 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from artbench_local_dataset import load_kaggle_artbench10_splits
 
+
+import requests, traceback
+
+def notify(msg, title="Notebook"):
+    requests.post("https://ntfy.sh/notebookIAGricardo",
+        data=msg, headers={"Title": title, "Priority": "high"})
+
+
+
 # %%
 class HFDatasetTorch(Dataset):
     def __init__(self, hf_split, transform=None, indices=None):
@@ -119,7 +128,7 @@ def build_loaders(
 def denorm(x):
     return (x + 1.0) / 2.0
 
-def show_image_grid(images, channels=3, title='Images', n_show=25):
+def show_image_grid(images, channels=3, title='Images', n_show=25, save_path=None):
     images = images[:n_show].detach().cpu()
     images = denorm(images).clamp(0, 1)
 
@@ -138,7 +147,49 @@ def show_image_grid(images, channels=3, title='Images', n_show=25):
             idx += 1
     fig.suptitle(title)
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
     plt.show()
+
+
+@torch.no_grad()
+def evaluate_metrics(model, schedule, dataloader, device, num_samples=5000, use_ddim=True, ddim_steps=100):
+    is_training = model.training
+    model.eval()
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    kid = KernelInceptionDistance(subset_size=100, subsets=50, normalize=True).to(device)
+
+    # Real images
+    count = 0
+    for real_imgs, _ in dataloader:
+        if count >= num_samples: break
+        batch = real_imgs[:num_samples-count].to(device)
+        batch_01 = denorm(batch).clamp(0, 1)
+        fid.update(batch_01, real=True)
+        kid.update(batch_01, real=True)
+        count += batch.size(0)
+
+    # Generated images
+    count = 0
+    batch_size = 50
+    while count < num_samples:
+        current_bs = min(batch_size, num_samples - count)
+        if use_ddim:
+            fake_imgs = schedule.ddim_sample_loop(model, (current_bs, 3, 32, 32), ddim_steps=ddim_steps)
+        else:
+            fake_imgs = schedule.p_sample_loop(model, (current_bs, 3, 32, 32))
+        fake_01 = denorm(fake_imgs).clamp(0, 1)
+        fid.update(fake_01, real=False)
+        kid.update(fake_01, real=False)
+        count += current_bs
+
+    fid_score = fid.compute().item()
+    kid_mean, kid_std = kid.compute()
+    fid.reset()
+    kid.reset()
+    if is_training:
+        model.train()
+    return fid_score, kid_mean.item(), kid_std.item()
 
 # %% [markdown]
 # ### Diffusion Components
@@ -383,17 +434,46 @@ class EMA:
     def get_model(self):
         return self.shadow
 
-def train_diffusion(model, loader, schedule, epochs=20, lr=2e-4, early_stopping=False, patience=10, 
-                    ema_decay=0.999, grad_clip=1.0, print_progress=True):
+
+def save_checkpoint(model, ema, history, checkpoint_path, params):
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'model_state': model.state_dict(),
+        'ema_state': ema.get_model().state_dict(),
+        'params': params,
+        'history': history
+    }, checkpoint_path)
+    print(f"✅ Checkpoint saved to {checkpoint_path}")
+
+
+def train_diffusion(
+    model, 
+    loader, 
+    schedule, 
+    epochs=20, 
+    lr=2e-4, 
+    ema_decay=0.999, 
+    grad_clip=1.0, 
+    print_progress=True,
+    val_loader=None,
+    checkpoint_dir=None,
+    save_interval=10,
+    num_fid_samples=1500,
+    model_params=None,
+    trial=None # Added for Optuna pruning
+):
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     ema = EMA(model, decay=ema_decay)
-    history = []
+    history = {'mse_loss': [], 'fid': []}
     model.train()
-    
-    best_loss = float('inf')
-    patience_counter = 0
-    best_weights = None
-    best_ema_weights = None
+
+    best_fid = float('inf')
+
+    if checkpoint_dir:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / 'samples').mkdir(exist_ok=True)
 
     for epoch in range(epochs):
         running = 0.0
@@ -403,7 +483,7 @@ def train_diffusion(model, loader, schedule, epochs=20, lr=2e-4, early_stopping=
             t = torch.randint(0, schedule.num_timesteps, (x.size(0),), device=device).long()
             noise = torch.randn_like(x)
             x_t = schedule.q_sample(x_0=x, t=t, noise=noise)
-            
+
             opt.zero_grad()
             pred_noise = model(x_t, t)
             loss = F.mse_loss(pred_noise, noise)
@@ -416,32 +496,54 @@ def train_diffusion(model, loader, schedule, epochs=20, lr=2e-4, early_stopping=
             n_batches += 1
 
         avg_loss = running / max(n_batches, 1)
-        history.append(avg_loss)
-        
-        if print_progress:
-            print(f'Epoch {epoch + 1:02d}/{epochs} | loss: {avg_loss:.6f}')
-            
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            if early_stopping:
-                patience_counter = 0
-                best_weights = copy.deepcopy(model.state_dict())
-                best_ema_weights = copy.deepcopy(ema.get_model().state_dict())
-        else:
-            if early_stopping:
-                patience_counter += 1
-        
-        if early_stopping and patience_counter >= patience:
-            if print_progress: 
-                print(f"Early stopping at epoch {epoch+1}")
-            break
+        history['mse_loss'].append(avg_loss)
 
-    if early_stopping and best_weights: 
-        model.load_state_dict(best_weights)
-    if early_stopping and best_ema_weights:
-        ema.shadow.load_state_dict(best_ema_weights)
-        
-    return history, best_loss, ema
+        status_str = f'Epoch {epoch + 1:02d}/{epochs} | loss: {avg_loss:.6f}'
+
+        # Optuna Pruning: Report progress and check if we should stop
+        if trial is not None:
+            trial.report(avg_loss, epoch)
+            if trial.should_prune():
+                if print_progress:
+                    print(f" Trial pruned at epoch {epoch+1}")
+                raise optuna.TrialPruned()
+
+        # Periodic Monitoring
+# Visual Samples, FID, and Checkpoints
+        if (epoch + 1) % save_interval == 0 or epoch == 0 or epoch == epochs - 1:
+            # 1. Visual Samples (using EMA model and DDIM)
+            if checkpoint_dir:
+                with torch.no_grad():
+                    ema_model = ema.get_model()
+                    ema_model.eval()
+                    samples = schedule.ddim_sample_loop(ema_model, (25, 3, 32, 32), ddim_steps=50)
+                    sample_path = checkpoint_dir / 'samples' / f'epoch_{epoch+1:03d}.png'
+                    show_image_grid(samples, channels=3, title=f'Epoch {epoch+1} (EMA/DDIM)', save_path=sample_path)
+                    model.train()
+
+            # 2. FID Metrics
+            if val_loader:
+                ema_model = ema.get_model()
+                fid_score, kid_mean, _ = evaluate_metrics(ema_model, schedule, val_loader, device, num_samples=num_fid_samples, ddim_steps=50)
+                history['fid'].append({'epoch': epoch + 1, 'fid': fid_score, 'kid': kid_mean})
+                status_str += f" | FID: {fid_score:.2f}"
+                
+                # Save best model based on FID
+                if fid_score < best_fid and checkpoint_dir:
+                    best_fid = fid_score
+                    save_checkpoint(model, ema, history, checkpoint_dir / 'best_fid_model.pt', model_params)
+                    if print_progress:
+                        print(f"   -> New best FID: {best_fid:.4f}. Saved best_fid_model.pt")
+
+            # 3. Regular Checkpoint
+            if checkpoint_dir:
+                save_checkpoint(model, ema, history, checkpoint_dir / f'checkpoint_epoch_{epoch+1:03d}.pt', model_params)
+
+        if print_progress:
+            print(status_str)
+
+    return history, best_fid, ema
+
 
 # %%
 # Load Data
@@ -449,30 +551,49 @@ artbench_train_loader, artbench_test_loader, artbench_channels, artbench_image_s
 
 # %%
 def objective(trial):
-    lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
-    channels = trial.suggest_categorical("model_channels", [64, 128])
-    beta_schedule = trial.suggest_categorical("beta_schedule", ["cosine", "linear"])
+    # Optimizing only the Learning Rate (LR) as per strategy
+    lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
     
-    model = PixelUNet(in_channels=3, model_channels=channels).to(device)
-    schedule = GaussianDiffusion(num_timesteps=1000, beta_schedule=beta_schedule, device=device)
+    # Fixed parameters recommended by the professor
+    fixed_channels = 128
+    fixed_schedule_type = 'cosine'
     
-    _, best_loss, _ = train_diffusion(
-        model, artbench_train_loader, schedule, 
-        epochs=30, lr=lr, print_progress=False
-    )
-    return best_loss
+    print(f"\n>>> Trial {trial.number} | LR: {lr:.6f} | Channels: {fixed_channels} | Schedule: {fixed_schedule_type}")
 
-print("Starting Optuna Study...")
-study = optuna.create_study(direction="minimize")
-study.optimize(objective, n_trials=10)
-print(f"Best params: {study.best_params}")
+    model = PixelUNet(in_channels=3, model_channels=fixed_channels).to(device)
+    schedule = GaussianDiffusion(num_timesteps=1000, beta_schedule=fixed_schedule_type, device=device)
+    
+    # We use MSE loss for Optuna optimization
+    try:
+        history, _, _ = train_diffusion(
+            model, 
+            artbench_train_loader, 
+            schedule, 
+            epochs=30, 
+            lr=lr, 
+            print_progress=False,
+            save_interval=31,
+            trial=trial # Pass the trial for pruning
+        )
+        return history['mse_loss'][-1]
+    except optuna.TrialPruned:
+        raise # Re-raise to let Optuna handle it correctly
+
+print("Starting Optuna Study (Optimizing Learning Rate with Pruning)...")
+study = optuna.create_study(
+    direction="minimize", 
+    sampler=optuna.samplers.TPESampler(seed=42),
+    pruner=optuna.pruners.MedianPruner(n_warmup_steps=5) # Start pruning after 5 epochs
+)
+study.optimize(objective, n_trials=10, gc_after_trial=True)
+
+print(f"\nMelhor LR encontrado: {study.best_params['lr']:.6f}")
+print(f"Melhor Loss: {study.best_value:.6f}")
 
 # %%
 # Train best model with best params from Optuna
-# Uncomment the line below to use Optuna results automatically:
 # best_params = study.best_params
 
-# Using best known params :
 best_lr = 0.000491
 best_channels = 128
 best_schedule_type = 'cosine'
@@ -480,9 +601,31 @@ best_schedule_type = 'cosine'
 best_pixel_model = PixelUNet(in_channels=3, model_channels=best_channels).to(device)
 pixel_diffusion = GaussianDiffusion(num_timesteps=1000, beta_schedule=best_schedule_type, device=device)
 
+# --- RE-LOAD FULL DATASET FOR FINAL TRAINING ---
+print("Re-loading full ArtBench dataset (50k images)...")
+artbench_train_loader_full, _, _, _, _ = build_loaders(
+    dataset_name='artbench',
+    batch_size=128,
+    train_limit=None,
+)
+
+model_params = {
+    'model_channels': best_channels, 
+    'lr': best_lr, 
+    'beta_schedule': best_schedule_type
+}
+
 history, _, pixel_ema = train_diffusion(
-    best_pixel_model, artbench_train_loader, pixel_diffusion, 
-    epochs=250, lr=best_lr, early_stopping=False, print_progress=True
+    best_pixel_model, 
+    artbench_train_loader_full, 
+    pixel_diffusion, 
+    epochs=250, 
+    lr=best_lr, 
+    print_progress=True,
+    val_loader=artbench_test_loader,
+    checkpoint_dir='runs/diffusion/final_run',
+    save_interval=10,
+    model_params=model_params
 )
 
 # Use EMA model for sampling (better quality)
@@ -490,7 +633,7 @@ best_pixel_ema_model = pixel_ema.get_model()
 
 # Plot training loss
 plt.figure(figsize=(10, 4))
-plt.plot(history, label='MSE Loss')
+plt.plot(history['mse_loss'], label='MSE Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.title('ArtBench-10 Pixel Diffusion - Training Loss')
@@ -499,16 +642,20 @@ plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# Save checkpoint
-import os
-os.makedirs('runs/diffusion', exist_ok=True)
-torch.save({
-    'model_state': best_pixel_model.state_dict(),
-    'ema_state': best_pixel_ema_model.state_dict(),
-    'params': {'model_channels': best_channels, 'lr': best_lr, 'beta_schedule': best_schedule_type},
-    'history': history
-}, 'runs/diffusion/artbench_pixel_diffusion.pt')
-print(f"✅ Modelo salvo em runs/diffusion/artbench_pixel_diffusion.pt")
+# Save final checkpoint
+save_checkpoint(
+    best_pixel_model, pixel_ema, history, 
+    'runs/diffusion/artbench_pixel_diffusion.pt', 
+    model_params
+)
+
+
+
+try:
+    pass
+    notify("✅ Finished successfully!")
+except Exception as e:
+    notify(f"❌ Failed: {traceback.format_exc()}", title="Notebook Error")
 
 # %%
 # ==========================================
@@ -521,8 +668,7 @@ if best_ckpt_path.exists():
     loaded_params = ckpt['params']
     loaded_model = PixelUNet(in_channels=3, model_channels=loaded_params['model_channels']).to(device)
     
-    loaded_model.load_state_dict(ckpt['model_state'])
-    """
+    
     # Prefer EMA weights if available (better sample quality)
     if 'ema_state' in ckpt:
         loaded_model.load_state_dict(ckpt['ema_state'])
@@ -538,7 +684,7 @@ if best_ckpt_path.exists():
 else:
     print(f"❌ Checkpoint {best_ckpt_path} not found. Skipping inference.")
     loaded_model = None
-"""
+
 # ==========================================
 # 2. GERANDO AMOSTRAS (DDIM - faster)
 # ==========================================
@@ -568,71 +714,15 @@ if loaded_model is not None:
     interp_grid = torch.cat(interp_images, dim=0)
     show_image_grid(interp_grid, channels=3, title='ArtBench-10 Pixel Diffusion - Interpolação Latente', n_show=n_interp)
 
-# %%
-import requests, traceback
-
-def notify(msg, title="Notebook"):
-    requests.post("https://ntfy.sh/notebookIAGricardo",
-        data=msg, headers={"Title": title, "Priority": "high"})
-
-try:
-    pass
-    notify("✅ Finished successfully!")
-except Exception as e:
-    notify(f"❌ Failed: {traceback.format_exc()}", title="Notebook Error")
-
 
 # %%
-@torch.no_grad()
-def evaluate_metrics(model, schedule, dataloader, device, num_samples=5000, use_ddim=True, ddim_steps=100):
-    model.eval()
-    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-    kid = KernelInceptionDistance(subset_size=100, subsets=50, normalize=True).to(device)
-
-    # Real images
-    print(f"Extracting features for {num_samples} real images...")
-    count = 0
-    with tqdm(total=num_samples, desc="Real Images", leave=False) as pbar:
-        for real_imgs, _ in dataloader:
-            if count >= num_samples: break
-            batch = real_imgs[:num_samples-count].to(device)
-            batch_01 = denorm(batch).clamp(0, 1)
-            fid.update(batch_01, real=True)
-            kid.update(batch_01, real=True)
-            
-            added = batch.size(0)
-            count += added
-            pbar.update(added)
-
-    # Generated images
-    sampler_name = f"DDIM ({ddim_steps} steps)" if use_ddim else "DDPM (1000 steps)"
-    print(f"Generating {num_samples} fake images via {sampler_name}...")
-    count = 0
-    batch_size = 50
-    with tqdm(total=num_samples, desc="Fake Images", leave=False) as pbar:
-        while count < num_samples:
-            current_bs = min(batch_size, num_samples - count)
-            if use_ddim:
-                fake_imgs = schedule.ddim_sample_loop(model, (current_bs, 3, 32, 32), ddim_steps=ddim_steps)
-            else:
-                fake_imgs = schedule.p_sample_loop(model, (current_bs, 3, 32, 32))
-            fake_01 = denorm(fake_imgs).clamp(0, 1)
-            fid.update(fake_01, real=False)
-            kid.update(fake_01, real=False)
-            
-            count += current_bs
-            pbar.update(current_bs)
-
-    print("Computing final metrics...")
-    return fid.compute().item(), kid.compute()[0].item()
-
 def run_robust_evaluation(model, schedule, dataloader, device, num_runs=10, use_ddim=True, ddim_steps=100):
     fids, kids = [], []
     print(f"Starting robust evaluation ({num_runs} runs)...")
     for i in range(num_runs):
         print(f"\n--- Starting Run {i+1}/{num_runs} ---")
         set_seed(100 + i)
-        f, k = evaluate_metrics(model, schedule, dataloader, device, use_ddim=use_ddim, ddim_steps=ddim_steps)
+        f, k, _ = evaluate_metrics(model, schedule, dataloader, device, use_ddim=use_ddim, ddim_steps=ddim_steps)
         fids.append(f)
         kids.append(k)
         print(f"Run {i+1}/{num_runs} Completed | FID: {f:.4f} | KID: {k:.4f}")
@@ -644,6 +734,15 @@ def run_robust_evaluation(model, schedule, dataloader, device, num_runs=10, use_
     print("="*30)
 
 # %%
-# Use EMA model for evaluation (better sample quality)
-eval_model = best_pixel_ema_model if 'best_pixel_ema_model' in dir() else best_pixel_model
-run_robust_evaluation(eval_model, pixel_diffusion, artbench_test_loader, device, use_ddim=True, ddim_steps=100)
+ckpt_path = Path('runs/diffusion/artbench_pixel_diffusion.pt')
+if ckpt_path.exists():
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    params = ckpt['params']
+
+    eval_model = PixelUNet(in_channels=3, model_channels=params['model_channels']).to(device)
+    eval_model.load_state_dict(ckpt['ema_state'])
+    eval_model.eval()
+
+    pixel_diffusion = GaussianDiffusion(num_timesteps=1000, beta_schedule=params['beta_schedule'], device=device)
+
+    run_robust_evaluation(eval_model, pixel_diffusion, artbench_test_loader, device, use_ddim=True, ddim_steps=100)

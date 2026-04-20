@@ -14,7 +14,7 @@
 # ---
 
 # %%
-# %pip install -q tqdm
+# %pip install -q tqdm torchmetrics optuna pandas requests
 # %matplotlib inline
 
 import sys
@@ -29,11 +29,15 @@ from tqdm.auto import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms as T
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.kid import KernelInceptionDistance
+import optuna
+import pandas as pd
 
-# Relative paths (run this script from student_start_pack/)
 # Using absolute paths to avoid issues with different working directories
 if "__file__" in globals():
     FILE_DIR = Path(__file__).resolve().parent
@@ -156,7 +160,51 @@ def denorm(x):
     return (x + 1.0) / 2.0
 
 
-def show_image_grid(images, channels, title='Images', n_show=25):
+@torch.no_grad()
+def evaluate_metrics(generator, dataloader, latent_dim, device, num_samples=5000):
+    """
+    Evaluates FID and KID metrics for the generator.
+    """
+    is_training = generator.training
+    generator.eval()
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    kid = KernelInceptionDistance(subset_size=100, subsets=50, normalize=True).to(device)
+
+    real_count = 0
+    for real_imgs, _ in dataloader:
+        if real_count >= num_samples:
+            break
+        batch_size = real_imgs.size(0)
+        if real_count + batch_size > num_samples:
+            real_imgs = real_imgs[:num_samples - real_count]
+            batch_size = real_imgs.size(0)
+        real_imgs = real_imgs.to(device)
+        real_imgs_01 = ((real_imgs + 1.0) / 2.0).clamp(0, 1)
+        fid.update(real_imgs_01, real=True)
+        kid.update(real_imgs_01, real=True)
+        real_count += batch_size
+
+    fake_count = 0
+    gen_batch = 100
+    while fake_count < num_samples:
+        current_batch_size = min(gen_batch, num_samples - fake_count)
+        z = torch.randn(current_batch_size, latent_dim, device=device)
+        fake_imgs = generator(z)
+        fake_imgs_01 = ((fake_imgs + 1.0) / 2.0).clamp(0, 1)
+        fid.update(fake_imgs_01, real=False)
+        kid.update(fake_imgs_01, real=False)
+        fake_count += current_batch_size
+
+    fid_score = fid.compute().item()
+    kid_mean, kid_std = kid.compute()
+    fid.reset()
+    kid.reset()
+    if is_training:
+        generator.train()
+    return fid_score, kid_mean.item(), kid_std.item()
+
+
+def show_image_grid(images, channels, title='Images', n_show=25, save_path=None):
     images = images[:n_show].detach().cpu()
     images = denorm(images).clamp(0, 1)
 
@@ -179,6 +227,8 @@ def show_image_grid(images, channels, title='Images', n_show=25):
 
     fig.suptitle(title)
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
     plt.show()
 
 
@@ -209,14 +259,13 @@ class DCGenerator(nn.Module):
 class DCDiscriminator(nn.Module):
     def __init__(self, image_channels=3, ndf=64):
         super().__init__()
+        # Slides: "BatchNorm in G, LayerNorm or none in D" — removed BN, kept spectral norm
         self.net = nn.Sequential(
             spectral_norm(nn.Conv2d(image_channels, ndf, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             spectral_norm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
-            nn.BatchNorm2d(ndf * 2),
             nn.LeakyReLU(0.2, inplace=True),
             spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False)),
-            nn.BatchNorm2d(ndf * 4),
             nn.LeakyReLU(0.2, inplace=True),
             spectral_norm(nn.Conv2d(ndf * 4, 1, 4, 1, 0, bias=False)),
         )
@@ -245,7 +294,7 @@ def plot_gan_losses(history, title='GAN losses'):
     plt.show()
 
 
-def save_checkpoint(generator, discriminator, history, checkpoint_path, latent_dim, channels, image_size):
+def save_checkpoint(generator, discriminator, history, checkpoint_path, latent_dim, channels, image_size, feature_maps=64):
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -257,6 +306,7 @@ def save_checkpoint(generator, discriminator, history, checkpoint_path, latent_d
                 'latent_dim': latent_dim,
                 'channels': channels,
                 'image_size': image_size,
+                'feature_maps': feature_maps,
             },
         },
         checkpoint_path,
@@ -268,7 +318,8 @@ def save_checkpoint(generator, discriminator, history, checkpoint_path, latent_d
 def load_dcgan_generator_for_inference(checkpoint_path):
     ckpt = torch.load(checkpoint_path, map_location=device)
     cfg = ckpt['config']
-    generator = DCGenerator(latent_dim=cfg['latent_dim'], image_channels=cfg['channels']).to(device)
+    ngf = cfg.get('feature_maps', 64)
+    generator = DCGenerator(latent_dim=cfg['latent_dim'], image_channels=cfg['channels'], ngf=ngf).to(device)
     generator.load_state_dict(ckpt['generator'])
     generator.eval()
     return generator, cfg, ckpt.get('history', None)
@@ -282,27 +333,33 @@ def train_gan(
     loader,
     latent_dim,
     epochs=20,
-    lr=2e-4,
+    lr_g=2e-4,
+    lr_d=4e-4,
     d_steps=2,
-    beta1=0.5,
+    beta1=0.0,
     beta2=0.99,
-    trial=None,
     print_progress=True,
-    patience=10,
-    use_early_stopping=True  # NOVA VARIÁVEL AQUI
+    val_loader=None,
+    checkpoint_dir=None,
+    save_interval=10,
+    num_fid_samples=1500
 ):
-    criterion = nn.BCEWithLogitsLoss()
-    opt_g = torch.optim.Adam(generator.parameters(), lr=lr, betas=(beta1, beta2))
-    opt_d = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=(beta1, beta2))
+    """
+    Trains a GAN with monitoring for visual samples and FID metrics.
+    """
+    opt_g = torch.optim.Adam(generator.parameters(), lr=lr_g, betas=(beta1, beta2))
+    opt_d = torch.optim.Adam(discriminator.parameters(), lr=lr_d, betas=(beta1, beta2))
 
-    history = {'g_loss': [], 'd_loss': []}
+    history = {'g_loss': [], 'd_loss': [], 'fid': []}
     generator.train()
     discriminator.train()
     
-    best_g_loss = float('inf')
-    patience_counter = 0
-    best_generator_weights = None
-    best_discriminator_weights = None 
+    best_fid = float('inf')
+    
+    if checkpoint_dir:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / 'samples').mkdir(exist_ok=True)
 
     for epoch in range(epochs):
         g_running = 0.0
@@ -313,109 +370,86 @@ def train_gan(
             real = real.to(device)
             bs = real.size(0)
 
-            real_targets = torch.ones(bs, 1, device=device)
-            fake_targets = torch.zeros(bs, 1, device=device)
-
-            # TODO START - Discriminator update
+            # --- Discriminator update (hinge loss) ---
             d_loss = None
             for _ in range(d_steps):
                 opt_d.zero_grad(set_to_none=True)
-                discriminator_real_outputs = discriminator(real)
-                d_loss_real = criterion(discriminator_real_outputs, real_targets)
+                d_real = discriminator(real)
+                d_loss_real = torch.mean(F.relu(1.0 - d_real))
 
                 noise = torch.randn(bs, latent_dim, device=device)
                 fake = generator(noise)
-                discriminator_fake_outputs = discriminator(fake.detach())
-                d_loss_fake = criterion(discriminator_fake_outputs, fake_targets)
+                d_fake = discriminator(fake.detach())
+                d_loss_fake = torch.mean(F.relu(1.0 + d_fake))
 
-                d_loss = 0.5 * (d_loss_real + d_loss_fake)
+                d_loss = d_loss_real + d_loss_fake
                 d_loss.backward()
                 opt_d.step()
-            # TODO END
 
-            if d_loss is None:
-                raise NotImplementedError('Implement Discriminator update in train_gan.')
-
-            # --- TODO START - Generator update ---
+            # --- Generator update (hinge loss) ---
             opt_g.zero_grad(set_to_none=True)
-
             noise = torch.randn(bs, latent_dim, device=device)
             fake = generator(noise)
-            discriminator_outputs_on_fake = discriminator(fake)
-
-            # Non-saturating generator objective: maximize log D(G(z)).
-            g_loss = criterion(discriminator_outputs_on_fake, real_targets)
-
+            g_fake = discriminator(fake)
+            g_loss = -torch.mean(g_fake)
             g_loss.backward()
             opt_g.step()
-            # TODO END
 
-            if g_loss is None:
-                raise NotImplementedError('Implement Generator update in train_gan.')
-
-            # TODO START - Bookkeeping
             g_running += g_loss.item()
             d_running += d_loss.item()
             n_batches += 1
-            # TODO END
             
-        # Calcula as médias da época atual
         epoch_g_loss = g_running / max(n_batches, 1)
         epoch_d_loss = d_running / max(n_batches, 1)
 
         history['g_loss'].append(epoch_g_loss)
         history['d_loss'].append(epoch_d_loss)
 
-        if trial is not None:
-            trial.report(epoch_g_loss, epoch)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
+        status_str = f"Epoch {epoch + 1:02d}/{epochs} | D loss: {epoch_d_loss:.4f} | G loss: {epoch_g_loss:.4f}"
+
+        # Periodic Monitoring: Visual Samples, FID, and Checkpoints
+        if (epoch + 1) % save_interval == 0 or epoch == 0 or epoch == epochs - 1:
+            # 1. Visual Samples
+            if checkpoint_dir:
+                with torch.no_grad():
+                    generator.eval()
+                    sample_noise = torch.randn(25, latent_dim, device=device)
+                    samples = generator(sample_noise)
+                    sample_path = checkpoint_dir / 'samples' / f'epoch_{epoch+1:03d}.png'
+                    show_image_grid(samples, channels=generator.net[-2].out_channels if hasattr(generator.net[-2], 'out_channels') else 3, 
+                                   title=f'Epoch {epoch+1}', save_path=sample_path)
+                    generator.train()
+
+            # 2. FID Metrics
+            if val_loader:
+                fid_score, kid_mean, _ = evaluate_metrics(generator, val_loader, latent_dim, device, num_samples=num_fid_samples)
+                history['fid'].append({'epoch': epoch + 1, 'fid': fid_score, 'kid': kid_mean})
+                status_str += f" | FID: {fid_score:.2f}"
+                
+                # Save best model based on FID
+                if fid_score < best_fid and checkpoint_dir:
+                    best_fid = fid_score
+                    save_checkpoint(
+                        generator, discriminator, history, 
+                        checkpoint_dir / 'best_fid_model.pt', 
+                        latent_dim, channels=3, image_size=32 # Defaults
+                    )
+                    if print_progress:
+                        print(f"   -> New best FID: {best_fid:.4f}. Saved best_fid_model.pt")
+
+            # 3. Regular Checkpoint
+            if checkpoint_dir:
+                save_checkpoint(
+                    generator, discriminator, history, 
+                    checkpoint_dir / f'checkpoint_epoch_{epoch+1:03d}.pt', 
+                    latent_dim, channels=3, image_size=32
+                )
 
         if print_progress:
-            print(
-                f"Epoch {epoch + 1:02d}/{epochs} | "
-                f"D loss: {history['d_loss'][-1]:.4f} | "
-                f"G loss: {history['g_loss'][-1]:.4f}"
-            )
-            
-        # --- LÓGICA DO EARLY STOPPING ---
-        if use_early_stopping:
-            warmup_epochs = 10
-            
-            if epoch < warmup_epochs:
-                best_g_loss = epoch_g_loss
-                best_generator_weights = copy.deepcopy(generator.state_dict())
-                best_discriminator_weights = copy.deepcopy(discriminator.state_dict())
-                if print_progress:
-                    print(f"   -> Aquecimento ({epoch+1}/{warmup_epochs}). Definindo linha de base: {best_g_loss:.4f}")
-            else:
-                if epoch_g_loss < best_g_loss:
-                    best_g_loss = epoch_g_loss
-                    patience_counter = 0
-                    best_generator_weights = copy.deepcopy(generator.state_dict())
-                    best_discriminator_weights = copy.deepcopy(discriminator.state_dict())
-                    if print_progress:
-                        print(f"   -> Nova melhor G Loss: {best_g_loss:.4f}. Resetando paciência.")
-                else:
-                    patience_counter += 1
-                    if print_progress:
-                        print(f"   -> Sem melhora. Paciência: {patience_counter}/{patience}")
+            print(status_str)
 
-                if patience_counter >= patience:
-                    if print_progress:
-                        print(f"\n[Early Stopping] Treinamento interrompido na época {epoch + 1}!")
-                    break
-        else:
-            # Se não estamos a usar early stopping, a "melhor loss" é simplesmente a última para não dar erro no return
-            best_g_loss = epoch_g_loss
-        # --------------------------------
+    return history, best_fid
 
-    # --- RESTAURAR OS MELHORES PESOS (Apenas se o Early Stopping estiver ativo) ---
-    if use_early_stopping and best_generator_weights is not None:
-        generator.load_state_dict(best_generator_weights)
-        discriminator.load_state_dict(best_discriminator_weights)
-
-    return history, best_g_loss
 
 
 # %%
@@ -456,8 +490,12 @@ artbench_history, _ = train_gan(
     loader=artbench_train_loader,
     latent_dim=artbench_latent_dim,
     epochs=artbench_epochs,
-    lr=artbench_lr,
-    print_progress=True
+    lr_g=artbench_lr,
+    lr_d=artbench_lr * 2,
+    print_progress=True,
+    val_loader=artbench_test_loader,
+    checkpoint_dir='runs/dcgan/dev_run',
+    save_interval=10
 )
 
 plot_gan_losses(artbench_history, title='ArtBench-10 DCGAN losses')
@@ -470,6 +508,7 @@ save_checkpoint(
     latent_dim=artbench_latent_dim,
     channels=artbench_channels,
     image_size=artbench_image_size,
+    feature_maps=64,
 )
 
 
@@ -557,21 +596,19 @@ if artbench_gen_infer is not None and artbench_cfg is not None:
     )
     # TODO END
 
-# %%
-import optuna
-import pandas as pd
-from pathlib import Path
 
+# %%
 def objective(trial):
-    # Busca mais alinhada à teoria DCGAN
-    lr = trial.suggest_float("lr", 1e-4, 5e-4, log=True)
-    z_dim = trial.suggest_categorical("latent_dim", [64, 100, 128])
-    d_steps = trial.suggest_categorical("d_steps", [1, 2, 3])
+    # TTUR: separate learning rates for G and D
+    lr_g = trial.suggest_float("lr_g", 1e-4, 5e-4, log=True)
+    lr_d = trial.suggest_float("lr_d", 1e-4, 1e-3, log=True)
+    z_dim = trial.suggest_categorical("latent_dim", [64, 100])
     beta1 = trial.suggest_categorical("beta1", [0.0, 0.5])
     feature_maps = trial.suggest_categorical("feature_maps", [64, 96])
+    d_steps = trial.suggest_categorical("d_steps", [1, 2])
 
     print(
-        f"\n>>> Trial {trial.number} | LR: {lr:.6f} | Z: {z_dim} | "
+        f"\n>>> Trial {trial.number} | LR_G: {lr_g:.6f} | LR_D: {lr_d:.6f} | Z: {z_dim} | "
         f"D steps: {d_steps} | beta1: {beta1} | FM: {feature_maps}"
     )
 
@@ -587,21 +624,31 @@ def objective(trial):
     generator.apply(init_dcgan_weights)
     discriminator.apply(init_dcgan_weights)
 
-    history, best_g_loss = train_gan(
+    history, _ = train_gan(
         generator=generator,
         discriminator=discriminator,
         loader=artbench_train_loader,
         latent_dim=z_dim,
         epochs=30,
-        lr=lr,
+        lr_g=lr_g,
+        lr_d=lr_d,
         d_steps=d_steps,
         beta1=beta1,
         beta2=0.99,
-        trial=trial,
         print_progress=False,
+        save_interval=31 # Disable periodic saving in Optuna to avoid clutter
     )
 
-    return best_g_loss
+    # Slides: "Monitor FID during training, not just loss"
+    fid_score, kid_mean, _ = evaluate_metrics(
+        generator=generator,
+        dataloader=artbench_test_loader,
+        latent_dim=z_dim,
+        device=device,
+        num_samples=1500
+    )
+    print(f"Trial {trial.number} finished with FID: {fid_score:.4f}")
+    return fid_score
 
 # --- EXECUTAR O OPTUNA ---
 print("Iniciando otimização com Optuna...")
@@ -609,14 +656,13 @@ print("Iniciando otimização com Optuna...")
 study = optuna.create_study(
     direction="minimize",
     sampler=optuna.samplers.TPESampler(seed=42),
-    pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
 )
 
 study.optimize(objective, n_trials=20, gc_after_trial=True)
 
 print("\n==== RESULTADOS DO OPTUNA ====")
 print(f"Melhor Trial: {study.best_trial.number}")
-print(f"Melhor Loss do Gerador: {study.best_value:.4f}")
+print(f"Melhor FID: {study.best_value:.4f}")
 print(f"Melhores Hiperparâmetros: {study.best_params}")
 
 # --- SALVAR RESULTADOS EM ARQUIVOS ---
@@ -627,6 +673,7 @@ output_dir.mkdir(parents=True, exist_ok=True)
 # 2. Salva o histórico completo de todas as tentativas em CSV
 df_results = study.trials_dataframe()
 csv_path = output_dir / "optuna_trials_history.csv"
+
 df_results.to_csv(csv_path, index=False)
 print(f"\nHistórico completo (CSV) salvo em: {csv_path}")
 
@@ -635,7 +682,7 @@ summary_path = output_dir / "optuna_best_summary.txt"
 with open(summary_path, "w") as f:
     f.write("==== RESULTADOS FINAIS OPTUNA - DCGAN ====\n")
     f.write(f"Melhor Trial: {study.best_trial.number}\n")
-    f.write(f"Melhor Loss do Gerador: {study.best_value:.4f}\n")
+    f.write(f"Melhor FID: {study.best_value:.4f}\n")
     f.write(f"Melhores Hiperparâmetros: {study.best_params}\n")
 print(f"Resumo dos melhores parâmetros (TXT) salvo em: {summary_path}")
 
@@ -644,14 +691,25 @@ print(f"Resumo dos melhores parâmetros (TXT) salvo em: {summary_path}")
 #
 
 # %%
+best_params = study.best_params
+print(best_params)
+
+
+# %%
 # Train with the best hyperparameters found by Optuna
-best_lr = 0.0003496206556181923
-best_z_dim = 64
+# Uncomment line below to use Optuna results automatically:
+#best_params = study.best_params
+
+
+
+
+best_lr_g = 0.0004994872054273084
+best_lr_d = 0.00035044090558002924
+best_z_dim = 100
 best_d_steps = 1
 best_beta1 = 0.0
 best_feature_maps = 64
 
-# Instanciamos os modelos passando os feature_maps (ngf e ndf)
 best_generator = DCGenerator(
     latent_dim=best_z_dim, 
     image_channels=artbench_channels,
@@ -666,18 +724,30 @@ best_discriminator = DCDiscriminator(
 best_generator.apply(init_dcgan_weights)
 best_discriminator.apply(init_dcgan_weights)
 
+# --- RE-LOAD FULL DATASET FOR FINAL TRAINING ---
+print("Re-loading full ArtBench dataset (50k images)...")
+artbench_train_loader_full, artbench_test_loader, _, _, _ = build_loaders(
+    dataset_name='artbench',
+    batch_size=128,
+    train_limit=None, # Use all 50k images
+    data_root='IAGdata/artbench-10-python',
+)
+
 best_history, _ = train_gan(
     generator=best_generator,
     discriminator=best_discriminator,
-    loader=artbench_train_loader,
+    loader=artbench_train_loader_full,
     latent_dim=best_z_dim,
-    epochs=50, 
-    lr=best_lr,
-    d_steps=best_d_steps, # Adicionado
-    beta1=best_beta1,     # Adicionado
-    beta2=0.99,           # Mantendo o valor padrão usado no Optuna
-    use_early_stopping=False,
-    print_progress=True
+    epochs=80,
+    lr_g=best_lr_g,
+    lr_d=best_lr_d,
+    d_steps=best_d_steps,
+    beta1=best_beta1,
+    beta2=0.99,
+    print_progress=True,
+    val_loader=artbench_test_loader,
+    checkpoint_dir='runs/dcgan/final_run',
+    save_interval=10
 )
 
 plot_gan_losses(best_history, title='ArtBench-10 DCGAN losses (Best Hyperparameters)')
@@ -691,6 +761,7 @@ save_checkpoint(
     latent_dim=best_z_dim,
     channels=artbench_channels,
     image_size=artbench_image_size,
+    feature_maps=best_feature_maps,
 )
 
 # %%
@@ -747,76 +818,8 @@ try:
 except Exception as e:
     notify(f"❌ Failed: {traceback.format_exc()}", title="Notebook Error")
 
+
 # %%
-import torch
-import numpy as np
-from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.kid import KernelInceptionDistance
-from tqdm.auto import tqdm
-
-@torch.no_grad()
-def evaluate_metrics(generator, dataloader, latent_dim, device, num_samples=5000):
-    """
-    Extrai features de 5000 imagens reais e 5000 imagens geradas
-    para calcular o FID e o KID de uma única execução.
-    """
-    generator.eval()
-    
-    # Inicializando as métricas. 
-    # normalize=True avisa que os tensores estarão no intervalo [0, 1] float
-    # KID configurado para 50 subsets de tamanho 100, como exige o enunciado
-    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-    kid = KernelInceptionDistance(subset_size=100, subsets=50, normalize=True).to(device)
-
-    print("Extraindo features de 5000 imagens REAIS...")
-    real_count = 0
-    for real_imgs, _ in dataloader:
-        if real_count >= num_samples:
-            break
-            
-        batch_size = real_imgs.size(0)
-        # Corta o batch se for ultrapassar 5000 imagens
-        if real_count + batch_size > num_samples:
-            real_imgs = real_imgs[:num_samples - real_count]
-            batch_size = real_imgs.size(0)
-
-        real_imgs = real_imgs.to(device)
-        # O dataloader normaliza as imagens para [-1, 1]. O torchmetrics espera [0, 1]
-        real_imgs_01 = ((real_imgs + 1.0) / 2.0).clamp(0, 1)
-
-        fid.update(real_imgs_01, real=True)
-        kid.update(real_imgs_01, real=True)
-        
-        real_count += batch_size
-
-    print("Gerando e extraindo features de 5000 imagens FALSAS...")
-    fake_count = 0
-    batch_size = 100 # Gera de 100 em 100 para não sobrecarregar a memória da GPU
-    while fake_count < num_samples:
-        current_batch_size = min(batch_size, num_samples - fake_count)
-        
-        z = torch.randn(current_batch_size, latent_dim, device=device)
-        fake_imgs = generator(z)
-        
-        # Mapeia [-1, 1] para [0, 1]
-        fake_imgs_01 = ((fake_imgs + 1.0) / 2.0).clamp(0, 1)
-
-        fid.update(fake_imgs_01, real=False)
-        kid.update(fake_imgs_01, real=False)
-        
-        fake_count += current_batch_size
-
-    # Computar os resultados
-    fid_score = fid.compute().item()
-    kid_mean, kid_std = kid.compute()
-    
-    # Limpa as métricas da memória para a próxima execução
-    fid.reset()
-    kid.reset()
-
-    return fid_score, kid_mean.item(), kid_std.item()
-
-
 def run_robust_evaluation(generator, dataloader, latent_dim, device, num_runs=10):
     """
     Roda a avaliação múltiplas vezes com seeds diferentes para robustez estatística
@@ -879,3 +882,5 @@ try:
     notify("✅ Finished successfully!")
 except Exception as e:
     notify(f"❌ Failed: {traceback.format_exc()}", title="Notebook Error")
+
+a
