@@ -1,7 +1,9 @@
 genai-env/
 student_start_pack/gan.py
 README.md
-student_start_pack/2 - Generative Adversarial Network.py
 requirements.txt
 scripts/__pycache__/
-student_start_pack/runs/
+sync.txt
+enuciado.txt
+student_start_pack/3 - Conditional GAN.ipynb
+student_start_pack/3 - Conditional GAN.py
