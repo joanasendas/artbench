@@ -746,3 +746,5 @@ if ckpt_path.exists():
     pixel_diffusion = GaussianDiffusion(num_timesteps=1000, beta_schedule=params['beta_schedule'], device=device)
 
     run_robust_evaluation(eval_model, pixel_diffusion, artbench_test_loader, device, use_ddim=True, ddim_steps=100)
+
+
