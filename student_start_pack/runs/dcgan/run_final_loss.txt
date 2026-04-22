@@ -1,0 +1,87 @@
+Epoch 01/80 | D loss: 1.7484 | G loss: -0.0173 | FID: 373.08 (New Best)
+Epoch 02/80 | D loss: 1.9772 | G loss: 0.0646
+Epoch 03/80 | D loss: 1.9939 | G loss: 0.0451
+Epoch 04/80 | D loss: 1.9966 | G loss: 0.0203
+Epoch 05/80 | D loss: 1.9897 | G loss: 0.0341
+Epoch 06/80 | D loss: 1.9858 | G loss: 0.0364
+Epoch 07/80 | D loss: 1.9921 | G loss: 0.0350
+Epoch 08/80 | D loss: 1.9946 | G loss: 0.0291
+Epoch 09/80 | D loss: 1.9958 | G loss: 0.0174
+Epoch 10/80 | D loss: 1.9948 | G loss: 0.0133 | FID: 125.46 (New Best)
+
+Epoch 11/80 | D loss: 1.9932 | G loss: 0.0114
+Epoch 12/80 | D loss: 1.9924 | G loss: 0.0083
+Epoch 13/80 | D loss: 1.9930 | G loss: 0.0039
+Epoch 14/80 | D loss: 1.9935 | G loss: 0.0083
+Epoch 15/80 | D loss: 1.9925 | G loss: 0.0075
+Epoch 16/80 | D loss: 1.9899 | G loss: 0.0097
+Epoch 17/80 | D loss: 1.9872 | G loss: 0.0103
+Epoch 18/80 | D loss: 1.9768 | G loss: 0.0169
+Epoch 19/80 | D loss: 1.9545 | G loss: 0.0216
+Epoch 20/80 | D loss: 1.9264 | G loss: 0.0201 | FID: 82.51 (New Best)
+
+Epoch 21/80 | D loss: 1.9075 | G loss: 0.0145
+Epoch 22/80 | D loss: 1.8925 | G loss: 0.0129
+Epoch 23/80 | D loss: 1.8907 | G loss: 0.0090
+Epoch 24/80 | D loss: 1.8848 | G loss: 0.0031
+Epoch 25/80 | D loss: 1.8848 | G loss: 0.0046
+Epoch 26/80 | D loss: 1.8814 | G loss: 0.0052
+Epoch 27/80 | D loss: 1.8830 | G loss: -0.0028
+Epoch 28/80 | D loss: 1.8809 | G loss: -0.0013
+Epoch 29/80 | D loss: 1.8846 | G loss: -0.0080
+Epoch 30/80 | D loss: 1.8834 | G loss: -0.0043 | FID: 91.64
+
+Epoch 31/80 | D loss: 1.8783 | G loss: -0.0107
+Epoch 32/80 | D loss: 1.8771 | G loss: -0.0072
+Epoch 33/80 | D loss: 1.8849 | G loss: -0.0075
+Epoch 34/80 | D loss: 1.8828 | G loss: -0.0124
+Epoch 35/80 | D loss: 1.8784 | G loss: -0.0135
+Epoch 36/80 | D loss: 1.8859 | G loss: -0.0129
+Epoch 37/80 | D loss: 1.8851 | G loss: -0.0124
+Epoch 38/80 | D loss: 1.8787 | G loss: -0.0143
+Epoch 39/80 | D loss: 1.8812 | G loss: -0.0202
+Epoch 40/80 | D loss: 1.8847 | G loss: -0.0174 | FID: 80.72 (New Best)
+
+Epoch 41/80 | D loss: 1.8781 | G loss: -0.0189
+Epoch 42/80 | D loss: 1.8850 | G loss: -0.0254
+Epoch 43/80 | D loss: 1.8787 | G loss: -0.0266
+Epoch 44/80 | D loss: 1.8797 | G loss: -0.0274
+Epoch 45/80 | D loss: 1.8795 | G loss: -0.0286
+Epoch 46/80 | D loss: 1.8790 | G loss: -0.0342
+Epoch 47/80 | D loss: 1.8880 | G loss: -0.0288
+Epoch 48/80 | D loss: 1.8745 | G loss: -0.0359
+Epoch 49/80 | D loss: 1.8836 | G loss: -0.0432
+Epoch 50/80 | D loss: 1.8790 | G loss: -0.0363 | FID: 78.91 (New Best)
+
+Epoch 51/80 | D loss: 1.8833 | G loss: -0.0422
+Epoch 52/80 | D loss: 1.8750 | G loss: -0.0467
+Epoch 53/80 | D loss: 1.8754 | G loss: -0.0432
+Epoch 54/80 | D loss: 1.8806 | G loss: -0.0515
+Epoch 55/80 | D loss: 1.8803 | G loss: -0.0462
+Epoch 56/80 | D loss: 1.8829 | G loss: -0.0585
+Epoch 57/80 | D loss: 1.8770 | G loss: -0.0583
+Epoch 58/80 | D loss: 1.8754 | G loss: -0.0634
+Epoch 59/80 | D loss: 1.8812 | G loss: -0.0666
+Epoch 60/80 | D loss: 1.8774 | G loss: -0.0681 | FID: 71.79 (New Best)
+
+Epoch 61/80 | D loss: 1.8775 | G loss: -0.0646
+Epoch 62/80 | D loss: 1.8771 | G loss: -0.0737
+Epoch 63/80 | D loss: 1.8779 | G loss: -0.0713
+Epoch 64/80 | D loss: 1.8784 | G loss: -0.0741
+Epoch 65/80 | D loss: 1.8807 | G loss: -0.0761
+Epoch 66/80 | D loss: 1.8725 | G loss: -0.0853
+Epoch 67/80 | D loss: 1.8760 | G loss: -0.0735
+Epoch 68/80 | D loss: 1.8817 | G loss: -0.0759
+Epoch 69/80 | D loss: 1.8762 | G loss: -0.0856
+Epoch 70/80 | D loss: 1.8819 | G loss: -0.0795 | FID: 70.40 (New Best)
+
+Epoch 71/80 | D loss: 1.8769 | G loss: -0.0930
+Epoch 72/80 | D loss: 1.8755 | G loss: -0.0835
+Epoch 73/80 | D loss: 1.8798 | G loss: -0.0906
+Epoch 74/80 | D loss: 1.8811 | G loss: -0.0900
+Epoch 75/80 | D loss: 1.8775 | G loss: -0.0868
+Epoch 76/80 | D loss: 1.8813 | G loss: -0.1011
+Epoch 77/80 | D loss: 1.8799 | G loss: -0.0968
+Epoch 78/80 | D loss: 1.8795 | G loss: -0.0910
+Epoch 79/80 | D loss: 1.8763 | G loss: -0.0987
+Epoch 80/80 | D loss: 1.8844 | G loss: -0.0930 | FID: 69.88 (Final Best)

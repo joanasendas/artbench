@@ -552,7 +552,7 @@ artbench_train_loader, artbench_test_loader, artbench_channels, artbench_image_s
 # %%
 def objective(trial):
     # Optimizing only the Learning Rate (LR) as per strategy
-    lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
+    lr = trial.suggest_float("lr", 1e-4, 3e-4, log=True)
     
     # Fixed parameters recommended by the professor
     fixed_channels = 128
@@ -594,7 +594,7 @@ print(f"Melhor Loss: {study.best_value:.6f}")
 # Train best model with best params from Optuna
 # best_params = study.best_params
 
-best_lr = 0.000491
+best_lr = 0.000193
 best_channels = 128
 best_schedule_type = 'cosine'
 
@@ -661,8 +661,7 @@ except Exception as e:
 # ==========================================
 # 1. CARREGANDO O MODELO TREINADO
 # ==========================================
-best_ckpt_path = Path('runs/diffusion/artbench_pixel_diffusion.pt')
-
+best_ckpt_path = Path('student_start_pack/runs/diffusion/final_run/best_fid_model.pt')
 if best_ckpt_path.exists():
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=True)
     loaded_params = ckpt['params']
