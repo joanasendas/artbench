@@ -661,7 +661,8 @@ except Exception as e:
 # ==========================================
 # 1. CARREGANDO O MODELO TREINADO
 # ==========================================
-best_ckpt_path = Path('student_start_pack/runs/diffusion/final_run/best_fid_model.pt')
+best_ckpt_path = Path('runs/diffusion/artbench_pixel_diffusion.pt')
+
 if best_ckpt_path.exists():
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=True)
     loaded_params = ckpt['params']
@@ -733,7 +734,7 @@ def run_robust_evaluation(model, schedule, dataloader, device, num_runs=10, use_
     print("="*30)
 
 # %%
-ckpt_path = Path('runs/diffusion/artbench_pixel_diffusion.pt')
+ckpt_path = Path('runs/diffusion/final_run/checkpoint_epoch_100.pt')
 if ckpt_path.exists():
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     params = ckpt['params']
@@ -747,3 +748,469 @@ if ckpt_path.exists():
     run_robust_evaluation(eval_model, pixel_diffusion, artbench_test_loader, device, use_ddim=True, ddim_steps=100)
 
 
+# %% [markdown]
+# ## Latent Diffusion Model (LDM)
+
+# %% [markdown]
+# ### ConvVAE + treino VAE
+
+# %%
+class ConvVAE(nn.Module):
+    def __init__(self, latent_channels=4):
+        super().__init__()
+        self.latent_channels = latent_channels
+ 
+        # Encoder: 3×32×32 → 128×8×8
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 3, stride=1, padding=1),
+            nn.GroupNorm(8, 64), nn.SiLU(),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),   # → 64×16×16
+            nn.GroupNorm(8, 64), nn.SiLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # → 128×8×8
+            nn.GroupNorm(8, 128), nn.SiLU(),
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            nn.GroupNorm(8, 128), nn.SiLU(),
+        )
+        # Cabeças mu e logvar espaciais: 128×8×8 → 4×8×8
+        self.conv_mu     = nn.Conv2d(128, latent_channels, 1)
+        self.conv_logvar = nn.Conv2d(128, latent_channels, 1)
+ 
+        # Decoder: 4×8×8 → 3×32×32
+        self.dec_input = nn.Conv2d(latent_channels, 128, 1)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            nn.GroupNorm(8, 128), nn.SiLU(),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), # → 64×16×16
+            nn.GroupNorm(8, 64), nn.SiLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # → 32×32×32
+            nn.GroupNorm(8, 32), nn.SiLU(),
+            nn.Conv2d(32, 3, 3, stride=1, padding=1),
+            nn.Sigmoid(),  # saída em [0, 1]
+        )
+ 
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.conv_mu(h), self.conv_logvar(h)
+ 
+    def reparameterize(self, mu, logvar):
+        eps = torch.randn_like(logvar)
+        return mu + eps * torch.exp(logvar * 0.5)
+ 
+    def decode(self, z):
+        return self.decoder(self.dec_input(z))
+ 
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+# %%
+def train_vae(vae, loader, epochs=50, lr=1e-3, beta_kl=1e-4,
+              checkpoint_path='runs/ldm/vae.pt'):
+    opt = torch.optim.AdamW(vae.parameters(), lr=lr, weight_decay=1e-2)
+    history = []
+    vae.train()
+    Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+ 
+    for epoch in range(epochs):
+        running = 0.0
+        for x, _ in tqdm(loader, desc=f'VAE Epoch {epoch+1}/{epochs}', leave=False):
+            x     = x.to(device)
+            x_01  = denorm(x).clamp(0, 1)
+ 
+            recon, mu, logvar = vae(x_01)
+ 
+            recon_loss = F.mse_loss(recon, x_01)
+            kl_loss    = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            loss       = recon_loss + beta_kl * kl_loss
+ 
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            running += loss.item()
+ 
+        avg = running / len(loader)
+        history.append(avg)
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"VAE Epoch {epoch+1:02d}/{epochs} | Loss: {avg:.5f} | Recon: {recon_loss.item():.5f} | KL: {kl_loss.item():.5f}")
+ 
+    torch.save(vae.state_dict(), checkpoint_path)
+    print(f"VAE guardado em {checkpoint_path}")
+    return history
+
+
+# %%
+vae = ConvVAE(latent_channels=4).to(device)
+vae_history = train_vae(vae, artbench_train_loader, epochs=50, lr=2e-4)
+
+# %%
+vae.eval()
+with torch.no_grad():
+    sample_batch, _ = next(iter(artbench_test_loader))
+    x_01 = denorm(sample_batch[:25]).clamp(0, 1).to(device)
+    recons, _, _ = vae(x_01)
+ 
+show_image_grid(recons * 2 - 1, title='VAE Reconstruções')
+show_image_grid(sample_batch[:25], title='Originais')
+
+
+# %% [markdown]
+# ### UNet para o espaço latente (LDM UNet)
+
+# %%
+class LatentUNet(nn.Module):
+    def __init__(self, in_channels=4, model_channels=128):
+        super().__init__()
+
+        self.channels = in_channels
+
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(model_channels),
+            nn.Linear(model_channels, model_channels * 4),
+            nn.SiLU(),
+            nn.Linear(model_channels * 4, model_channels * 4),
+        )
+        time_dim = model_channels * 4
+
+        # Entrada
+        self.init_conv = nn.Conv2d(self.channels, model_channels, 3, padding=1)
+
+        # Encoder: 8×8 → 4×4
+        self.down_res1  = ResnetBlock(model_channels, time_dim)
+        self.down_res2  = ResnetBlock(model_channels, time_dim)
+        self.down_attn  = SelfAttention(model_channels)
+        self.down_res3  = ResnetBlock(model_channels, time_dim)
+        self.downsample = nn.Conv2d(model_channels, model_channels, 3, stride=2, padding=1)
+
+        # Bottleneck: 4×4
+        self.mid_res1 = ResnetBlock(model_channels, time_dim)
+        self.mid_attn = SelfAttention(model_channels)
+        self.mid_res2 = ResnetBlock(model_channels, time_dim)
+
+        # Decoder: 4×4 → 8×8
+        self.upsample  = nn.ConvTranspose2d(model_channels, model_channels, 4, stride=2, padding=1)
+        self.up_res1   = ResnetBlock(model_channels * 2, time_dim, out_dim=model_channels)
+        self.up_res2   = ResnetBlock(model_channels, time_dim)
+        self.up_attn   = SelfAttention(model_channels)
+        self.up_res3   = ResnetBlock(model_channels, time_dim)
+
+        # Saída
+        self.out_norm = nn.GroupNorm(min(32, model_channels), model_channels)
+        self.out_act  = nn.SiLU()
+        self.out_conv = nn.Conv2d(model_channels, self.channels, 3, padding=1)
+
+    def forward(self, z, t):
+        t_emb = self.time_embed(t)
+
+        x = self.init_conv(z)
+
+        # Encoder
+        x = self.down_res1(x, t_emb)
+        x = self.down_res2(x, t_emb)
+        x = self.down_attn(x)
+        h = self.down_res3(x, t_emb)   
+        x = self.downsample(h)          
+
+        # Bottleneck
+        x = self.mid_res1(x, t_emb)
+        x = self.mid_attn(x)
+        x = self.mid_res2(x, t_emb)
+
+        # Decoder com skip connection
+        x = self.upsample(x)            
+        x = torch.cat([x, h], dim=1)   
+        x = self.up_res1(x, t_emb)
+        x = self.up_res2(x, t_emb)
+        x = self.up_attn(x)
+        x = self.up_res3(x, t_emb)
+
+        return self.out_conv(self.out_act(self.out_norm(x)))  
+
+
+# %% [markdown]
+# ### Optuna — Search de LR para o LDM
+
+# %%
+# Latent scaling factor (standard LDM trick)
+LATENT_SCALE = 0.18215
+
+def train_ldm_full(
+    model, vae, loader, schedule,
+    epochs=20, lr=2e-4, ema_decay=0.999, grad_clip=1.0,
+    print_progress=True, val_loader=None,
+    checkpoint_dir=None, save_interval=10,
+    num_fid_samples=1500, model_params=None, trial=None
+):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    ema = EMA(model, decay=ema_decay)
+    history = {'mse_loss': [], 'fid': []}
+    vae.eval()
+    model.train()
+    best_fid = float('inf')
+ 
+    if checkpoint_dir:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / 'samples').mkdir(exist_ok=True)
+ 
+    for epoch in range(epochs):
+        running = 0.0
+        for x, _ in tqdm(loader, desc=f'LDM Epoch {epoch+1}/{epochs}',
+                          leave=False, disable=not print_progress):
+            x = x.to(device)
+            with torch.no_grad():
+                mu, logvar = vae.encode(denorm(x))
+                z = vae.reparameterize(mu, logvar)  # (B, 4, 8, 8)
+                z = z * LATENT_SCALE # Scale latents to unit variance
+ 
+            t     = torch.randint(0, schedule.num_timesteps, (x.size(0),), device=device).long()
+            noise = torch.randn_like(z)
+            z_t   = schedule.q_sample(z, t, noise)
+ 
+            opt.zero_grad()
+            pred = model(z_t, t)
+            loss = F.mse_loss(pred, noise)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            ema.update(model)
+            running += loss.item()
+ 
+        avg_loss = running / len(loader)
+        history['mse_loss'].append(avg_loss)
+        status_str = f'LDM Epoch {epoch+1:02d}/{epochs} | loss: {avg_loss:.6f}'
+ 
+        # Optuna pruning
+        if trial is not None:
+            trial.report(avg_loss, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+ 
+        if (epoch+1) % save_interval == 0 or epoch == 0 or epoch == epochs-1:
+ 
+            # Amostras visuais
+            if checkpoint_dir:
+                ema_model = ema.get_model()
+                ema_model.eval()
+                with torch.no_grad():
+                    z_rand = torch.randn(25, model.channels, 8, 8, device=device)
+                    z_gen  = schedule.ddim_sample_loop(ema_model, z_rand.shape,
+                                                        ddim_steps=50, x_init=z_rand)
+                    imgs = vae.decode(z_gen / LATENT_SCALE) * 2 - 1  
+                show_image_grid(imgs, title=f'LDM Epoch {epoch+1}',
+                                save_path=checkpoint_dir / 'samples' / f'epoch_{epoch+1:03d}.png')
+                model.train()
+ 
+            # FID / KID
+            if val_loader:
+                ema_model = ema.get_model()
+                fid_score, kid_mean, _ = evaluate_ldm_metrics(
+                    ema_model, vae, schedule, val_loader, device,
+                    num_samples=num_fid_samples
+                )
+                history['fid'].append({'epoch': epoch+1, 'fid': fid_score, 'kid': kid_mean})
+                status_str += f' | FID: {fid_score:.2f}'
+ 
+                if fid_score < best_fid and checkpoint_dir:
+                    best_fid = fid_score
+                    save_checkpoint(model, ema, history,
+                                    checkpoint_dir / 'best_fid_model.pt', model_params)
+                    if print_progress:
+                        print(f'   -> Novo melhor FID: {best_fid:.4f}')
+ 
+            #Checkpoint periódico
+            if checkpoint_dir:
+                save_checkpoint(model, ema, history,
+                                checkpoint_dir / f'checkpoint_epoch_{epoch+1:03d}.pt',
+                                model_params)
+ 
+        if print_progress:
+            print(status_str)
+ 
+    return history, best_fid, ema
+
+
+# %%
+@torch.no_grad()
+def evaluate_ldm_metrics(ldm_model, vae, schedule, dataloader, device,
+                          num_samples=1500, ddim_steps=50):
+    ldm_model.eval()
+    vae.eval()
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    kid = KernelInceptionDistance(subset_size=100, subsets=50, normalize=True).to(device)
+
+    # Imagens reais
+    count = 0
+    for real_imgs, _ in dataloader:
+        if count >= num_samples:
+            break
+        batch = real_imgs[:num_samples - count].to(device)
+        fid.update(denorm(batch).clamp(0, 1), real=True)
+        kid.update(denorm(batch).clamp(0, 1), real=True)
+        count += batch.size(0)
+
+    # Imagens geradas
+    count = 0
+    bs = 50
+    while count < num_samples:
+        cur_bs = min(bs, num_samples - count)
+        z = torch.randn(cur_bs, ldm_model.channels, 8, 8, device=device)
+        z_gen = schedule.ddim_sample_loop(ldm_model, z.shape,
+                                           ddim_steps=ddim_steps, x_init=z)
+        imgs = vae.decode(z_gen / LATENT_SCALE)
+        # VAE termina com Sigmoid → já em [0,1], sem denorm
+        fid.update(imgs.clamp(0, 1), real=False)
+        kid.update(imgs.clamp(0, 1), real=False)
+        count += cur_bs
+
+    fid_val = fid.compute().item()
+    kid_m, kid_s = kid.compute()
+    fid.reset()
+    kid.reset()
+    return fid_val, kid_m.item(), kid_s.item()
+
+
+# %%
+def ldm_objective(trial):
+    lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
+    print(f"\n>>> LDM Trial {trial.number} | LR: {lr:.6f}")
+
+    model    = LatentUNet(in_channels=4, model_channels=128).to(device)
+    schedule = GaussianDiffusion(num_timesteps=1000, beta_schedule='cosine', device=device)
+
+    try:
+        history, _, _ = train_ldm_full(
+            model, vae, artbench_train_loader, schedule,
+            epochs=30, lr=lr, print_progress=False,
+            save_interval=31, trial=trial
+        )
+        return history['mse_loss'][-1]
+    except optuna.TrialPruned:
+        raise
+
+
+# %%
+ldm_study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+    pruner=optuna.pruners.MedianPruner(n_warmup_steps=5)
+)
+ldm_study.optimize(ldm_objective, n_trials=10, gc_after_trial=True)
+
+print(f"\nMelhor LR LDM: {ldm_study.best_params['lr']:.6f}")
+print(f"Melhor Loss:   {ldm_study.best_value:.6f}")
+
+# %% [markdown]
+# ### Treino final LDM com melhor LR
+
+# %%
+best_ldm_lr = ldm_study.best_params['lr']
+
+ldm_model    = LatentUNet(in_channels=4, model_channels=128).to(device)
+ldm_schedule = GaussianDiffusion(num_timesteps=1000, beta_schedule='cosine', device=device)
+
+# dataset completo 
+artbench_train_full, _, _, _, _ = build_loaders(batch_size=128, train_limit=None)
+
+ldm_params = {
+    'model_channels': 128, 
+    'lr': best_ldm_lr,
+    'beta_schedule': 'cosine',
+    'latent_channels': 4
+}
+
+ldm_history, _, ldm_ema = train_ldm_full(
+    ldm_model, vae, artbench_train_full, ldm_schedule,
+    epochs=100,  
+    lr=best_ldm_lr,
+    print_progress=True,
+    val_loader=artbench_test_loader,
+    checkpoint_dir='runs/ldm/final_run',
+    save_interval=10,
+    model_params=ldm_params
+)
+
+# Plot loss
+plt.figure(figsize=(10, 4))
+plt.plot(ldm_history['mse_loss'], label='LDM MSE Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('LDM — Training Loss')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Guardar checkpoint final
+save_checkpoint(ldm_model, ldm_ema, ldm_history,'runs/ldm/artbench_ldm.pt', ldm_params)
+
+
+# %% [markdown]
+# ### Inferência + Interpolação latente
+
+# %%
+ldm_ckpt_path = Path('runs/ldm/artbench_ldm.pt')
+if ldm_ckpt_path.exists():
+    ckpt = torch.load(ldm_ckpt_path, map_location=device, weights_only=True)
+    p = ckpt['params']
+    loaded_ldm = LatentUNet(in_channels=p.get('latent_channels', 4), model_channels=p['model_channels']).to(device)
+    loaded_ldm.load_state_dict(ckpt['ema_state'])
+    loaded_ldm.eval()
+    loaded_ldm_schedule = GaussianDiffusion(
+        num_timesteps=1000, beta_schedule=p['beta_schedule'], device=device
+    )
+    print(f"LDM carregado | params: {p}")
+else:
+    loaded_ldm = ldm_ema.get_model()
+    loaded_ldm.eval()
+    loaded_ldm_schedule = ldm_schedule
+
+# Gerar amostras
+vae.eval()
+with torch.no_grad():
+    z_rand = torch.randn(25, loaded_ldm.channels, 8, 8, device=device)
+    z_gen  = loaded_ldm_schedule.ddim_sample_loop(
+        loaded_ldm, z_rand.shape, ddim_steps=100, x_init=z_rand
+    )
+    imgs = vae.decode(z_gen / LATENT_SCALE) * 2 - 1  # [0,1] → [-1,1] para show_image_grid
+show_image_grid(imgs, title='LDM — Amostras Geradas (DDIM 100 steps)', n_show=25)
+
+# Interpolação no espaço latente
+z1 = torch.randn(1, loaded_ldm.channels, 8, 8, device=device)
+z2 = torch.randn(1, loaded_ldm.channels, 8, 8, device=device)
+interp_imgs = []
+with torch.no_grad():
+    for alpha_val in torch.linspace(0, 1, 10):
+        z_i   = (1 - alpha_val) * z1 + alpha_val * z2
+        z_gen = loaded_ldm_schedule.ddim_sample_loop(
+            loaded_ldm, z_i.shape, ddim_steps=100, eta=0.0, x_init=z_i
+        )
+        interp_imgs.append(vae.decode(z_gen / LATENT_SCALE) * 2 - 1)  # [0,1] → [-1,1]
+show_image_grid(torch.cat(interp_imgs), title='LDM — Interpolação Latente', n_show=10)
+
+
+# %% [markdown]
+# ### Avaliação robusta
+
+# %%
+def run_robust_evaluation_ldm(ldm_model, vae, schedule, dataloader, device, num_runs=10, ddim_steps=100):
+    fids, kids = [], []
+    print(f"Robust evaluation LDM ({num_runs} runs)...")
+    for i in range(num_runs):
+        set_seed(100 + i)
+        f, k, _ = evaluate_ldm_metrics(
+            ldm_model, vae, schedule, dataloader, device, ddim_steps=ddim_steps
+        )
+        fids.append(f)
+        kids.append(k)
+        print(f"Run {i+1}/{num_runs} | FID: {f:.4f} | KID: {k:.4f}")
+
+    print("\n" + "=" * 30)
+    print(f"LDM FINAL ({num_runs} runs):")
+    print(f"FID: {np.mean(fids):.4f} ± {np.std(fids):.4f}")
+    print(f"KID: {np.mean(kids):.4f} ± {np.std(kids):.4f}")
+    print("=" * 30)
+
+
+run_robust_evaluation_ldm(loaded_ldm, vae, loaded_ldm_schedule, artbench_test_loader, device)

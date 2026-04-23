@@ -1,0 +1,238 @@
+% This is samplepaper.tex, a sample chapter demonstrating the
+% LLNCS macro package for Springer Computer Science proceedings;
+% Version 2.21 of 2022/01/12
+%
+\documentclass[runningheads]{llncs}
+
+%
+\usepackage[T1]{fontenc}
+% T1 fonts will be used to generate the final print and online PDFs,
+% so please use T1 fonts in your manuscript whenever possible.
+% Other font encondings may result in incorrect characters.
+%
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage[backend=biber,style=numeric]{biblatex}
+\addbibresource{references/bibliography.bib}
+% Used for displaying a sample figure. If possible, figure files should
+% be included in EPS format.
+%
+% If you use the hyperref package, please uncomment the following two lines
+% to display URLs in blue roman font according to Springer's eBook style:
+%\usepackage{color}
+%\renewcommand\UrlFont{\color{blue}\rmfamily}
+%\urlstyle{rm}
+%
+\begin{document}
+%
+\title{ArtBench\\Generative Modeling}
+%
+%\titlerunning{Abbreviated paper title}
+% If the paper title is too long for the running head, you can set
+% an abbreviated paper title here
+%
+\author{Joana Sendas \and Ricardo Paredes}
+%
+%\authorrunning{F. Author et al.}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+%
+\institute{University of Coimbra}
+%
+\maketitle              % typeset the header of the contribution
+%
+\begin{abstract}
+This paper presents a comparative study of generative models applied to the visual arts domain using the ArtBench-10 dataset. We implement, train, and evaluate three distinct families of generative architectures: Variational Autoencoders (VAEs), Generative Adversarial Networks (GANs), and Diffusion Models. Our objective is to synthesize high-fidelity, diverse, and stylistically consistent images of paintings while navigating the inherent trade-offs of each paradigm. To ensure statistical robustness, we evaluate the models quantitatively using Fréchet Inception Distance (FID) and Kernel Inception Distance (KID) averaged across multiple random seeds. Our final findings reveal that the Pixel-Space Diffusion model achieves the highest generative quality (FID: 24.08), significantly outperforming the other architectures. Furthermore, while Wasserstein GANs with Gradient Penalty (WGAN-GP) successfully stabilize adversarial training to provide a fast-inference alternative, Latent Diffusion Models (LDMs) demonstrate a severe performance bottleneck heavily reliant on the perceptual compression capabilities of the underlying autoencoder.
+
+\keywords{Generative AI \and Image Generation \and ArtBench \and Generative Models \and GANs \and Variational Autoencoders \and Diffusion Models \and FID \and KID.}
+\end{abstract}
+%
+%
+%
+\section{Introduction}
+Generative Artificial Intelligence has seen remarkable advancements, particularly in the synthesis of high-fidelity images. The application of these models to the visual arts requires capturing complex distributions of brushstrokes, color palettes, and distinct artistic styles. This project, conducted as part of the Generative AI course at the University of Coimbra, aims to learn generative models from artwork images and produce plausible new samples matching the data distribution. 
+
+We explore three main families of generative models: Autoencoders, Generative Adversarial Networks (GANs), and Diffusion Models. By building a complete pipeline from data loading to evaluation, we compare these approaches based on their visual fidelity, diversity, and style consistency.
+
+\section{Problem Description}
+The target domain for this study is the ArtBench-10 dataset \cite{artbench2022}, a curated collection of artworks designed to benchmark generative models. The dataset consists of 50,000 training images, all at a 32x32 RGB resolution, categorized into 10 distinct artistic styles.
+
+The primary challenge lies in the nature of the generative task. Unlike discriminative tasks (such as classification), success cannot be measured by a simple accuracy metric. Instead, the models must balance visual fidelity with diversity and style consistency. Consequently, the quality of the generated distributions must be assessed using rigorous quantitative distribution-level metrics alongside qualitative visual inspection.
+
+\section{Methodology and Approach}
+To comprehensively explore generative modeling, we implemented variants across the three required architectural families.
+
+\subsection{Autoencoders (VAEs)}
+Variational Autoencoders map inputs to a continuous, probabilistic latent space, ensuring smooth interpolations but often suffering from blurrier outputs. After establishing baselines with Dense and Convolutional Autoencoders, we focused on more advanced variants. Specifically, we implemented a Denoising VAE (dVAE) architecture, which introduces noise to the inputs during training to encourage the learning of robust structural features, and a Conditional VAE (CondVAE), which conditions the latent space on the 10 artistic style labels. 
+
+\subsection{Generative Adversarial Networks (GANs)}
+
+\subsubsection{Deep Convolutional GAN (DCGAN)}
+Our baseline adversarial model follows the Deep Convolutional GAN (DCGAN) architecture, tailored for the $32 \times 32 \times 3$ spatial resolution of the ArtBench-10 dataset. 
+
+The \textbf{Generator} takes a noise vector $z \sim \mathcal{N}(0, I)$ from a 100-dimensional latent space and projects it through a series of fractional-strided convolutions (\texttt{ConvTranspose2d}). Each layer, except the output, is followed by Batch Normalization and a ReLU activation. The final layer utilizes a Tanh activation to map the generated images to a $[-1, 1]$ pixel range.
+
+The \textbf{Discriminator} mirrors this structure using strided convolutions to downsample the image, paired with LeakyReLU activations (negative slope of 0.2). To address the notorious training instability and mode collapse common in standard GANs, we introduced several modern stabilization techniques into our DCGAN baseline:
+\begin{itemize}
+    \item \textbf{Spectral Normalization:} We removed Batch Normalization from the Discriminator and instead applied Spectral Normalization to all convolutional weights. This strictly bounds the Lipschitz constant of the Discriminator, stabilizing its gradients during adversarial training.
+    \item \textbf{Hinge Loss:} Instead of the standard min-max Binary Cross-Entropy loss, we optimized the network using the geometric Hinge Loss. This pushes the Discriminator outputs apart while preventing vanishing gradients for the Generator.
+    \item \textbf{Two Time-Scale Update Rule (TTUR):} We decoupled the optimizers for the Generator and Discriminator, allowing them to use distinct learning rates ($\alpha_G$ and $\alpha_D$). We also parameterized $n_{critic}$ steps, enabling the Discriminator to update multiple times per Generator step.
+\end{itemize}
+
+Following standard practices for stable adversarial training, network weights for convolutional layers were initialized from a zero-centered Normal distribution ($\mu=0, \sigma=0.02$), while Batch Normalization weights were initialized with $\mu=1.0$ and $\sigma=0.02$ \cite{radford2015unsupervised}.
+
+\subsubsection{Wasserstein GAN with Gradient Penalty (WGAN-GP)}
+While the DCGAN architecture provides a strong baseline, adversarial training using the Jensen-Shannon divergence often suffers from vanishing gradients and mode collapse. To address this, we implemented a Wasserstein GAN with Gradient Penalty (WGAN-GP) \cite{gulrajani2017improved}, which minimizes the Earth-Mover (Wasserstein-1) distance between the real and generated distributions.
+
+The Generator retains a fractional-strided convolutional architecture similar to our DCGAN baseline. However, the Discriminator is replaced by a \textit{Critic} network. Unlike a standard discriminator that outputs a probability in $[0, 1]$, the Critic outputs an unbounded scalar score representing the Wasserstein distance. To enforce the 1-Lipschitz continuity required by the Wasserstein metric, we applied a gradient penalty:
+\begin{equation}
+    L_{GP} = \lambda \mathbb{E}_{\hat{x} \sim \mathbb{P}_{\hat{x}}} \left[ \left( ||\nabla_{\hat{x}} C(\hat{x})||_2 - 1 \right)^2 \right]
+\end{equation}
+where $\hat{x}$ are random linear interpolations between real and fake samples, and we set $\lambda = 10$. 
+
+Because the gradient penalty penalizes the norm of the critic's gradient with respect to each input independently, batch-level normalizations are invalid. Therefore, we replaced Batch Normalization in the Critic with Layer Normalization (\texttt{LayerNorm}), which normalizes features independently for each sample.
+
+Additionally, to prevent the Critic's unbounded outputs from drifting arbitrarily far from zero during training, we incorporated a small drift penalty, $L_{drift} = \epsilon \mathbb{E}_{x}[C(x)^2]$, with $\epsilon = 0.001$. 
+
+The networks were optimized using Adam with momentum parameters $\beta_1=0.0$ and $\beta_2=0.99$. To ensure the Critic provides accurate Wasserstein distance estimates, we updated the Critic five times ($n_{critic} = 5$) for every single Generator update.
+
+
+\subsection{Diffusion Models}
+Diffusion models learn to synthesize data by reversing a gradual noising process. We implemented two distinct diffusion pipelines: a standard Pixel-Space Diffusion model and a Latent Diffusion Model (LDM). 
+
+\subsubsection{Pixel-Space Diffusion}
+Our baseline diffusion model operates directly on the $32 \times 32 \times 3$ image space. The reverse denoising network is parameterized as a U-Net \cite{ho2020denoising}. To condition the network on the diffusion timestep $t$, we utilized Sinusoidal Positional Embeddings, which are projected and added to the feature maps inside residual blocks. The U-Net employs Group Normalization, SiLU activations, and incorporates Self-Attention blocks at lower spatial resolutions ($16 \times 16$ and $8 \times 8$) to capture global contextual relationships.
+
+The forward diffusion process utilizes a \textit{cosine} variance schedule \cite{nichol2021improved}, which is specifically advantageous for low-resolution images as it prevents the premature destruction of signal compared to standard linear schedules. The network was trained to predict the added noise ($\epsilon$-prediction) using the Mean Squared Error (MSE) objective, optimized via AdamW with gradient clipping.
+
+To enhance generation quality and stabilize the reverse process, we maintained an Exponential Moving Average (EMA) of the model weights with a decay rate of 0.999. All evaluations and final inferences were conducted using the EMA weights. Furthermore, to accelerate generation, we employed the Denoising Diffusion Implicit Models (DDIM) \cite{song2020denoising} sampling strategy, reducing the reverse process from 1000 training timesteps to just 100 inference steps.
+\subsubsection{Latent Diffusion Model (LDM)}
+Operating directly in pixel space can be computationally prohibitive. To address this, we implemented a Latent Diffusion Model (LDM) \cite{rombach2022high}, which separates the generative process into two distinct stages: perceptual compression and latent diffusion. 
+
+For the compression stage, rather than utilizing our baseline autoencoders (which utilized flat latent vectors), we trained a dedicated, unconditional Convolutional VAE (ConvVAE) from scratch. This ConvVAE was specifically designed to project the $32 \times 32 \times 3$ RGB images into a compact $8 \times 8 \times 4$ spatial latent representation. To ensure the latent space was highly expressive and structurally robust for diffusion, we implemented several architectural refinements: we utilized 4 latent channels to prevent the loss of critical high-frequency image details during compression, and replaced Batch Normalization with Group Normalization across both the ConvVAE and the diffusion network to maintain stability independent of batch size dependencies.
+
+A critical mathematical requirement for standard diffusion noise schedules is that the target data distribution maintains roughly unit variance ($\sigma \approx 1$). Because the raw latent space of a VAE does not naturally conform to this, a mismatch with the cosine noise schedule can occur. To rectify this, we introduced a latent scaling factor ($s \approx 0.18215$). During training, the encoded latents are multiplied by this factor before diffusion; during inference, the generated latents are appropriately unscaled before being passed to the ConvVAE decoder.
+
+A specialized \texttt{LatentUNet} was then trained entirely within this scaled latent space. To handle the complex transitions of the latent manifold, we increased the depth of the network by adding additional ResNet blocks. The model was optimized using AdamW with weight decay to provide better regularization. During inference, noise is iteratively denoised in the latent space using the DDIM sampler, and the final latent tensor is passed through the frozen ConvVAE decoder to recover the $32 \times 32$ image. This approach significantly reduces the spatial dimensionality of the diffusion process while maintaining high-fidelity perceptual details.
+
+\section{Experimental Setup}
+
+Our experimental pipeline was designed to ensure rigorous hyperparameter selection, efficient compute utilization, and statistically robust final evaluations.
+
+\subsection{Training Strategy and Hyperparameter Tuning}
+Following the project guidelines, the development phase was conducted on a 20\% subset (10,000 images) of the ArtBench-10 training data. This reduced scale allowed for rapid iteration and systematic hyperparameter tuning using the \textbf{Optuna} framework. Through Optuna, we optimized architectural choices (e.g., latent dimensions, network depth) and training hyperparameters (e.g., learning rates, optimizer betas, weight decay). 
+
+Once the optimal hyperparameters were identified for each model family (VAEs, GANs, and Diffusion), the best-performing architectures were retrained from scratch on the full 50,000-image dataset for the final comparative analysis.
+
+\subsection{Evaluation Protocol}
+Because generative tasks lack a single ground-truth output, we evaluated our models using distribution-level metrics: the \textbf{Fréchet Inception Distance (FID)} and the \textbf{Kernel Inception Distance (KID)}. These metrics measure the distance between the feature representations of real and generated images extracted from a pre-trained Inception-v3 network.
+
+For the final evaluation of each model, we generated a set of $N = 5,000$ synthetic images and compared them against $5,000$ real images sampled from the ArtBench-10 test split. To compute the KID, we utilized 50 random subsets of size 100.
+
+\subsection{Statistical Robustness}
+Generative models—particularly GANs—can exhibit high variance depending on the random noise vectors sampled during inference. To guarantee the statistical reliability of our results, we repeated the evaluation protocol 10 times for each trained model. For each of the 10 iterations, we enforced strict deterministic behavior by updating the pseudo-random number generator seeds (\texttt{numpy} and \texttt{torch} seeds initialized to $100 + i$, where $i$ is the run index). We report the final FID and KID scores as the Mean $\pm$ Standard Deviation across these 10 independent runs.
+
+
+\section{Analysis of the Results}
+
+\subsection{Quantitative Results}
+Table~\ref{tab:results} presents the final quantitative results across our trained models. 
+
+\begin{table}[h]
+\centering
+\caption{Quantitative evaluation on the ArtBench-10 dataset (Mean $\pm$ Std across 10 random seeds). Lower values indicate better performance.}
+\label{tab:results}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model} & \textbf{FID ($\downarrow$)} & \textbf{KID ($\downarrow$)} \\ \midrule
+Best VAE (e.g., dVAE) & TBD $\pm$ TBD & TBD $\pm$ TBD \\
+DCGAN                 & $48.2119 \pm 0.2072$ & $0.0269 \pm 0.0007$ \\
+WGAN-GP               & $43.0661 \pm 0.4466$ & $0.0230 \pm 0.0009$ \\
+Pixel Diffusion       & $24.0786 \pm 0.1921$ & $0.0082 \pm 0.0003$ \\
+Latent Diffusion (LDM)& $101.5644 \pm 0.8803$ & $0.0641 \pm 0.0014$ \\ \bottomrule
+\end{tabular}
+\end{table}
+
+As shown in Table~\ref{tab:results}, the Pixel Diffusion model significantly outperformed all other architectures, achieving the lowest FID ($24.08$) and KID ($0.008$). This aligns with recent literature indicating that diffusion models excel at capturing complex, multi-modal distributions such as varied artistic styles.
+
+Within the adversarial family, the WGAN-GP successfully improved upon the DCGAN baseline, lowering the FID from $48.21$ to $43.07$ and the KID from $0.0269$ to $0.0230$. This demonstrates that replacing the Jensen-Shannon divergence with the Wasserstein distance—coupled with the gradient penalty—not only stabilized the training dynamics but also improved the distributional matching of the generated art.
+
+Interestingly, the Latent Diffusion Model (LDM) performed significantly worse than its pixel-space counterpart, recording a high FID of $101.56$. This performance drop is likely attributable to the perceptual compression bottleneck. Because the LDM operates within the latent space of a pre-trained VAE, any high-frequency details (such as sharp brushstrokes) lost during the initial encoding-decoding phase represent a strict upper bound on generation quality. Even if the diffusion network perfectly models the latent manifold, it cannot recover details that the VAE inherently blurs.
+
+\subsection{Qualitative Results}
+To corroborate our quantitative metrics, we conducted a visual inspection of the generated samples and latent space traversals. Figure~\ref{fig:diffusion_visuals} illustrates the outputs of our best-performing model, the Pixel-Space Diffusion.
+
+As reflected by the superior FID score, the Diffusion samples exhibit fine granular details, coherent artistic structures, and high stylistic diversity without obvious signs of mode collapse. Furthermore, the latent space interpolations (Figure~\ref{fig:diffusion_visuals}b) demonstrate smooth, continuous semantic transitions between distinct artistic styles, confirming that the model learned a well-structured geometric manifold rather than simply memorizing the training data.
+
+% TODO: Add a sentence here about the VAE images once you have them. (e.g., "In contrast, while the VAE interpolations were similarly smooth, the generated samples lacked the high-frequency sharpness of the Diffusion model.")
+
+\begin{figure}[htpb]
+    \centering
+    % Left side: Random Grid
+    \begin{minipage}{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/amostras_diffusion.png}
+        \caption*{a) Random Samples}
+    \end{minipage}\hfill
+    % Right side: Interpolation
+    \begin{minipage}{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/latent_walk_diffusion.png}
+        \caption*{b) Latent Space Interpolation}
+    \end{minipage}
+    \caption{Qualitative results for the Pixel Diffusion model. The random samples (a) exhibit high structural fidelity and diversity. The latent interpolation (b) demonstrates smooth transitions between artistic styles, confirming a well-structured latent space.}
+    \label{fig:diffusion_visuals}
+\end{figure}
+
+\begin{figure}[htpb]
+    \centering
+    % Left side: Random Grid
+    \begin{minipage}{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/amostras_WGAN.png}
+        \caption*{a) Random Samples}
+    \end{minipage}\hfill
+    % Right side: Interpolation
+    \begin{minipage}{0.48\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{images/latent_walk_wgan.png}
+        \caption*{b) Latent Space Interpolation}
+    \end{minipage}
+    \caption{Qualitative results for the WGAN-GP model. While the generated samples (a) capture broad stylistic colors, they exhibit more visual artifacts compared to the diffusion model. The latent interpolation (b) shows the model's ability to transition between concepts, though with slightly less structural coherence.}
+    \label{fig:wgan_visuals}
+\end{figure}
+
+
+
+\clearpage
+
+\section{Conclusion}
+In this project, we successfully implemented and evaluated three distinct families of generative models—Autoencoders, GANs, and Diffusion Models—on the ArtBench-10 dataset. Our comparative analysis revealed clear trade-offs between architectural complexity, training stability, inference speed, and ultimate sample quality.
+
+The Pixel-Space Diffusion model emerged as the definitively superior architecture in terms of distribution-level metrics, achieving an FID of 24.08. It demonstrated an exceptional ability to capture the complex, multi-modal distribution of artistic styles without suffering from mode collapse. However, this quality came at the cost of significantly slower inference times compared to single-pass models.
+
+Within the adversarial family, we observed that while the baseline DCGAN was prone to instability, the implementation of the Wasserstein distance and gradient penalty (WGAN-GP) successfully stabilized training and improved the FID to 43.07. GANs remain highly competitive when inference speed is prioritized over absolute distributional perfection.
+
+Finally, our exploration of Latent Diffusion Models (LDM) highlighted the critical importance of the compression stage. The high FID (101.56) of our LDM indicates a perceptual compression bottleneck; the diffusion process is strictly bounded by the detail-retention capabilities of the underlying Autoencoder. 
+
+% TODO: Add one brief sentence here summarizing the VAE performance once your colleague finishes (e.g., "Meanwhile, the VAEs provided the most stable training dynamics and smoothest latent spaces, but generated perceptually blurrier images than both GANs and Diffusion.")
+
+Ultimately, this study confirms that while Diffusion models currently represent the state-of-the-art for high-fidelity artistic synthesis, architectural selection must be guided by the specific constraints of the deployment environment, balancing the need for visual quality against computational overhead.
+
+\section*{Acknowledgments}
+During the development of this project, we utilized Generative AI tools to assist with code debugging, hyperparameter tuning strategies with Optuna, and drafting the structural layout of this report. All AI-assisted components were reviewed and adapted to ensure correctness, originality, and alignment with project goals.
+
+% ---- Bibliography ----
+%
+% BibTeX users should specify bibliography style 'splncs04'.
+% References will then be sorted and formatted in the correct style.
+%
+% \bibliographystyle{splncs04}
+% \bibliography{mybibliography}
+%
+\printbibliography
+\input{appendix/appendix}
+\end{document}
+
+
