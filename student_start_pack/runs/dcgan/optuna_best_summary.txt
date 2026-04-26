@@ -1,4 +1,0 @@
-==== RESULTADOS FINAIS OPTUNA - DCGAN ====
-Melhor Trial: 15
-Melhor FID: 132.0364
-Melhores Hiperparâmetros: {'lr_g': 0.0004994872054273084, 'lr_d': 0.00035044090558002924, 'latent_dim': 100, 'beta1': 0.0, 'feature_maps': 64, 'd_steps': 1}
